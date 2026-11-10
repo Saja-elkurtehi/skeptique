@@ -1,0 +1,19 @@
+.DS_Store
+
+# Dependencies and build output
+**/node_modules/
+**/dist/
+
+# Local environment files (templates remain tracked)
+.env
+**/.env
+.env.*
+**/.env.*
+!.env.example
+!**/.env.example
+
+# Logs and local editor settings
+*.log
+.vscode/
+.idea/
+

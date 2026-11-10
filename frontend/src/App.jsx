@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { HashRouter as Router, Routes, Route } from 'react-router-dom'
 import Landing from './components/Landing'
 import StoryView from './components/StoryView'
+import Methodology from './components/Methodology'
 import './App.css'
 import './index.css'
 
@@ -44,6 +45,10 @@ function App() {
         <Route
           path="/stories/:id"
           element={<StoryView darkMode={darkMode} setDarkMode={setDarkMode} />}
+        />
+        <Route
+          path="/methodology"
+          element={<Methodology darkMode={darkMode} setDarkMode={setDarkMode} />}
         />
       </Routes>
     </Router>

@@ -7,18 +7,28 @@ const crypto = require("crypto");
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 const NEWS_API_KEY = process.env.NEWS_API_KEY;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 
+const allowedOrigins = new Set([
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'https://saja-elkurtehi.github.io',
+  process.env.FRONTEND_URL,
+].filter(Boolean));
+
+app.disable("x-powered-by");
+
 app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'https://saja-elkurtehi.github.io',
-  ]
+  origin(origin, callback) {
+    const isLocalPreview = /^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin || '');
+    if (!origin || allowedOrigins.has(origin) || isLocalPreview) return callback(null, true);
+    return callback(new Error('Origin is not allowed by CORS'));
+  },
 }));
-app.use(express.json());
+app.use(express.json({ limit: "100kb" }));
 
 const localStories = require("./data/stories.json");
 
@@ -41,6 +51,7 @@ async function callGemini(prompt, temperature = 0.2) {
         model: "google/gemini-2.5-pro",
         messages: [{ role: "user", content: prompt }],
         temperature,
+        max_tokens: 1000,
       },
       {
         headers: {
@@ -49,6 +60,7 @@ async function callGemini(prompt, temperature = 0.2) {
           "HTTP-Referer": "http://localhost:5173",
           "X-Title": "Skeptique",
         },
+        timeout: 7000,
       }
     );
 
@@ -78,11 +90,12 @@ async function fetchArticles(topic) {
       pageSize: 8,
       apiKey: NEWS_API_KEY,
     },
+    timeout: 10000,
   });
 
   return (res.data.articles || []).map((a, i) => ({
     id: `newsapi-${i}`,
-    source: a.source?.name || "Unknown",
+    name: a.source?.name || "Unknown",
     title: a.title || "Untitled",
     summary: a.description || a.content || "",
     url: a.url,
@@ -110,13 +123,70 @@ function inferFrame(summary) {
   return "Other";
 }
 
+function assessBiasSignal(article) {
+  const text = `${article.title || ""} ${article.summary || ""}`.toLowerCase();
+  const loadedTerms = text.match(/\b(shocking|disaster|outrage|radical|extreme|devastating|chaos|destroy|betray|disgrace|threat|crisis)\b/g) || [];
+  const certaintyTerms = text.match(/\b(obviously|undeniably|clearly|always|never|everyone|nobody|must)\b/g) || [];
+  const attributionTerms = text.match(/\b(according to|reported|data|study|research|officials said|evidence)\b/g) || [];
+  const punctuationPenalty = Math.min(10, ((article.title || "").match(/[!?]/g) || []).length * 5);
+
+  const score = Math.max(0, Math.min(100,
+    12 + loadedTerms.length * 9 + certaintyTerms.length * 6 + punctuationPenalty - attributionTerms.length * 3
+  ));
+
+  const label = score < 25 ? "Low" : score < 50 ? "Moderate" : score < 75 ? "Elevated" : "High";
+  const signals = [];
+  if (loadedTerms.length) signals.push(`${loadedTerms.length} emotionally loaded term${loadedTerms.length === 1 ? "" : "s"}`);
+  if (certaintyTerms.length) signals.push(`${certaintyTerms.length} absolute or certainty claim${certaintyTerms.length === 1 ? "" : "s"}`);
+  if (attributionTerms.length) signals.push(`${attributionTerms.length} attribution or evidence cue${attributionTerms.length === 1 ? "" : "s"}`);
+  if (!signals.length) signals.push("No strong language signals detected in the available excerpt");
+
+  return { score, label, signals, methodology: "language-framing-v1" };
+}
+
+function annotateArticles(articles) {
+  articles.forEach((article) => {
+    article.tone = inferTone(article.summary || "");
+    article.frame = inferFrame(`${article.title || ""} ${article.summary || ""}`);
+    article.bias = assessBiasSignal(article);
+  });
+}
+
+function fallbackSynthesis(topic, articles) {
+  const usable = articles.filter((article) => article.summary).slice(0, 3);
+  const frames = [...new Set(articles.map((article) => article.frame).filter((frame) => frame && frame !== "Other"))];
+  const coverageNote = frames.length
+    ? `The coverage emphasizes ${frames.slice(0, 3).join(", ").toLowerCase()} dimensions.`
+    : "The available excerpts do not share one clearly dominant frame.";
+  const evidence = usable.map((article) => `${article.name} reports that ${article.summary.replace(/[.!?]+$/, "")}`).join("; ");
+
+  return {
+    summary: {
+      content: evidence
+        ? `Current reporting on ${topic} includes several distinct developments: ${evidence}. ${coverageNote}`
+        : `Current reporting on ${topic} is available below. ${coverageNote}`,
+      oneSentence: usable[0] ? `${usable[0].summary} ${coverageNote}` : null,
+      eli5: `Different outlets are highlighting different parts of ${topic}; compare the source cards below to see where their emphasis changes.`,
+      dataOnly: "Review the linked articles for figures and primary evidence; automated extraction was unavailable for this refresh.",
+      politicalAngle: frames.includes("Political") ? "At least one available excerpt emphasizes policy, government, or regulation." : "No strong political frame was detected in the available excerpts.",
+      humanitarianAngle: frames.includes("Humanitarian") ? "At least one available excerpt emphasizes effects on people or communities." : "No strong humanitarian frame was detected in the available excerpts.",
+    },
+    blindSpots: [
+      "The available excerpts may omit important context from the full articles",
+      "Source availability may overrepresent outlets indexed by the news provider",
+      "Claims repeated across outlets may still originate from the same underlying source",
+    ],
+    labels: [],
+  };
+}
+
 /* -------------------------------------------------------
    SEMANTIC HASH (for caching)
 ------------------------------------------------------- */
 function articleHash(articles) {
   return crypto
     .createHash("sha1")
-    .update(articles.map((a) => a.title + a.source).join("|"))
+    .update(articles.map((a) => a.title + a.name).join("|"))
     .digest("hex");
 }
 
@@ -127,7 +197,7 @@ function articleHash(articles) {
     const text = articles
       .map(
         (a, i) =>
-          `Article ${i + 1} (${a.source}): ${a.title}\n${a.summary || "No summary"}`
+          `Article ${i + 1} (${a.name}): ${a.title}\n${a.summary || "No summary"}`
       )
       .join("\n\n");
 
@@ -142,7 +212,11 @@ function articleHash(articles) {
   {
     "summary": {
       "content": "2–4 neutral sentences",
-      "oneSentence": "Exactly one sentence"
+      "oneSentence": "Exactly one sentence",
+      "eli5": "A plain-language explanation for a general audience",
+      "dataOnly": "Only concrete figures and verifiable claims, or a note that none are available",
+      "politicalAngle": "The key political or policy implications",
+      "humanitarianAngle": "The key effects on people and communities"
     },
     "blindSpots": ["item 1","item 2","item 3"],
     "labels": [
@@ -157,8 +231,8 @@ function articleHash(articles) {
     const raw = await callGemini(prompt, 0.2);
 
     if (!raw) {
-      console.warn("AI returned nothing");
-      return null;
+      console.warn("AI returned nothing; using source-based fallback");
+      return fallbackSynthesis(topic, articles);
     }
 
     console.log("🧠 RAW AI OUTPUT:\n", raw);
@@ -167,14 +241,14 @@ function articleHash(articles) {
     const match = raw.match(/\{[\s\S]*\}/);
     if (!match) {
       console.warn("No JSON object found in AI output");
-      return null;
+      return fallbackSynthesis(topic, articles);
     }
 
     try {
       return JSON.parse(match[0]);
     } catch (err) {
       console.error("AI JSON parse failed:", err.message);
-      return null;
+      return fallbackSynthesis(topic, articles);
     }
   }
 
@@ -184,7 +258,15 @@ function articleHash(articles) {
 ------------------------------------------------------- */
 
 app.get("/", (_, res) => {
-  res.json({ message: "Skeptique backend running" });
+  res.json({ message: "Skeptique backend running", status: "ok" });
+});
+
+app.get("/health", (_, res) => {
+  res.json({
+    status: "ok",
+    newsConfigured: Boolean(NEWS_API_KEY),
+    aiConfigured: Boolean(OPENROUTER_API_KEY),
+  });
 });
 
 /* LANDING — NO AI */
@@ -194,19 +276,38 @@ app.get("/stories", (_, res) => {
       id: s.id,
       title: s.title,
       tags: s.tags,
-      sources: s.sourcesCount ?? 0,
+      sourcesCount: s.sourcesCount ?? s.sources?.length ?? 0,
       lastUpdated: s.lastUpdated,
     }))
   );
 });
 
-/* STORY VIEW */
-app.get("/stories/:id", async (req, res) => {
+/* SAVED STORY VIEW — instant, with no external calls */
+app.get("/stories/:id", (req, res) => {
   const story = localStories[req.params.id];
   if (!story) return res.status(404).json({ error: "Not found" });
 
-  const articles = await fetchArticles(story.title);
-  if (!articles.length) return res.json(story);
+  res.json({ ...story, isLive: false });
+});
+
+/* OPTIONAL LIVE REFRESH */
+app.get("/stories/:id/live", async (req, res) => {
+  const story = localStories[req.params.id];
+  if (!story) return res.status(404).json({ error: "Not found" });
+
+  let articles = [];
+  try {
+    articles = await fetchArticles(story.title);
+  } catch (err) {
+    console.error("News fetch failed; returning saved story:", err.message);
+  }
+  if (!articles.length) {
+    return res.status(503).json({
+      error: NEWS_API_KEY
+        ? "No recent articles were found for this topic"
+        : "Live coverage is not configured on this server",
+    });
+  }
 
   const hash = articleHash(articles);
   const cached = storyCache.get(hash);
@@ -215,11 +316,7 @@ app.get("/stories/:id", async (req, res) => {
     return res.json(cached.data);
   }
 
-  // heuristic labels
-  articles.forEach((a) => {
-    a.tone = inferTone(a.summary);
-    a.frame = inferFrame(a.summary);
-  });
+  annotateArticles(articles);
 
   const ai = await aiSynthesize(story.title, articles);
 
@@ -236,15 +333,21 @@ app.get("/stories/:id", async (req, res) => {
 
   const result = {
     ...story,
+    isLive: true,
     sourcesCount: articles.length,
     sources: articles,
     lastUpdated: "Just now",
     combinedSummary: {
-      content: ai?.summary?.content || "Not available",
+      ...story.combinedSummary,
+      content: ai?.summary?.content || story.combinedSummary?.content || "Not available",
       oneSentence: ai?.summary?.oneSentence || null,
+      eli5: ai?.summary?.eli5 || null,
+      dataOnly: ai?.summary?.dataOnly || null,
+      politicalAngle: ai?.summary?.politicalAngle || null,
+      humanitarianAngle: ai?.summary?.humanitarianAngle || null,
     },
     blindSpots: {
-      items: ai?.blindSpots || [],
+      items: ai?.blindSpots?.length ? ai.blindSpots : story.blindSpots?.items || [],
     },
   };
 
@@ -259,9 +362,9 @@ app.get("/stories/:id", async (req, res) => {
    SEARCH STORY — WITH AI SYNTHESIS
 ------------------------------------------------------- */
 app.get("/search/story", async (req, res) => {
-  const { q } = req.query;
+  const q = String(req.query.q || "").trim().slice(0, 120);
 
-  if (!q || q.trim().length < 2) {
+  if (q.length < 2) {
     return res.status(400).json({ error: "Query too short" });
   }
 
@@ -270,7 +373,11 @@ app.get("/search/story", async (req, res) => {
     const articles = await fetchArticles(q);
 
     if (!articles.length) {
-      return res.status(404).json({ error: "No articles found" });
+      return res.status(503).json({
+        error: NEWS_API_KEY
+          ? "No recent articles were found for that topic"
+          : "Live search is not configured on this server",
+      });
     }
 
     // 2. Hash for caching
@@ -281,11 +388,8 @@ app.get("/search/story", async (req, res) => {
       return res.json(cached.data);
     }
 
-    // 3. Initial heuristic labels (fallback)
-    articles.forEach((a) => {
-      a.tone = inferTone(a.summary);
-      a.frame = inferFrame(a.summary);
-    });
+    // 3. Transparent language and framing signals
+    annotateArticles(articles);
 
     // 4. AI synthesis (summary + blind spots + per-article labels)
     const ai = await aiSynthesize(q, articles);
@@ -308,11 +412,16 @@ app.get("/search/story", async (req, res) => {
       sourcesCount: articles.length,
       sources: articles,
       lastUpdated: "Live",
+      isLive: true,
       combinedSummary: {
         content:
           ai?.summary?.content ||
           "This topic was generated from a live search across multiple news outlets.",
         oneSentence: ai?.summary?.oneSentence || null,
+        eli5: ai?.summary?.eli5 || null,
+        dataOnly: ai?.summary?.dataOnly || null,
+        politicalAngle: ai?.summary?.politicalAngle || null,
+        humanitarianAngle: ai?.summary?.humanitarianAngle || null,
       },
       blindSpots: {
         items: ai?.blindSpots || [],
@@ -328,8 +437,13 @@ app.get("/search/story", async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error("Search story AI error:", err.message);
-    res.status(500).json({ error: "Search story failed" });
+    res.status(502).json({ error: "The news service is temporarily unavailable" });
   }
+});
+
+app.use((err, _req, res, _next) => {
+  console.error("Request error:", err.message);
+  res.status(500).json({ error: "The server could not process this request" });
 });
 
 
@@ -337,6 +451,11 @@ app.get("/search/story", async (req, res) => {
 /* -------------------------------------------------------
    START SERVER
 ------------------------------------------------------- */
-app.listen(PORT, () => {
-  console.log(`Skeptique backend running at http://localhost:${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Skeptique backend running at http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
+module.exports._internal = { inferTone, inferFrame, assessBiasSignal, articleHash, fallbackSynthesis };
