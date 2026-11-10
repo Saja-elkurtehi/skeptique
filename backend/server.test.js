@@ -42,3 +42,13 @@ test('source-based synthesis remains useful when the AI provider is unavailable'
   assert.match(result.summary.content, /political dimensions/i);
   assert.equal(result.blindSpots.length, 3);
 });
+
+test('framing has no arbitrary baseline and detects inflections with evidence', () => {
+  assert.equal(_internal.assessBiasSignal({ title: 'Council meets on Tuesday' }).score, 0);
+  const result = _internal.assessBiasSignal({ title: 'Destroying homes', summary: 'Homes were destroyed.' });
+  assert.ok(result.score > 0);
+  assert.match(result.signals.join(' '), /destroying/);
+  assert.equal(_internal.assessBiasSignal({}), null);
+  assert.equal(_internal.assessBiasSignal({ title: 'Shocking shocking shocking' }).score, 9);
+  assert.equal(_internal.assessBiasSignal({ title: 'Shocking', summary: 'According to research' }).score, 9);
+});

@@ -123,26 +123,7 @@ function inferFrame(summary) {
   return "Other";
 }
 
-function assessBiasSignal(article) {
-  const text = `${article.title || ""} ${article.summary || ""}`.toLowerCase();
-  const loadedTerms = text.match(/\b(shocking|disaster|outrage|radical|extreme|devastating|chaos|destroy|betray|disgrace|threat|crisis)\b/g) || [];
-  const certaintyTerms = text.match(/\b(obviously|undeniably|clearly|always|never|everyone|nobody|must)\b/g) || [];
-  const attributionTerms = text.match(/\b(according to|reported|data|study|research|officials said|evidence)\b/g) || [];
-  const punctuationPenalty = Math.min(10, ((article.title || "").match(/[!?]/g) || []).length * 5);
-
-  const score = Math.max(0, Math.min(100,
-    12 + loadedTerms.length * 9 + certaintyTerms.length * 6 + punctuationPenalty - attributionTerms.length * 3
-  ));
-
-  const label = score < 25 ? "Low" : score < 50 ? "Moderate" : score < 75 ? "Elevated" : "High";
-  const signals = [];
-  if (loadedTerms.length) signals.push(`${loadedTerms.length} emotionally loaded term${loadedTerms.length === 1 ? "" : "s"}`);
-  if (certaintyTerms.length) signals.push(`${certaintyTerms.length} absolute or certainty claim${certaintyTerms.length === 1 ? "" : "s"}`);
-  if (attributionTerms.length) signals.push(`${attributionTerms.length} attribution or evidence cue${attributionTerms.length === 1 ? "" : "s"}`);
-  if (!signals.length) signals.push("No strong language signals detected in the available excerpt");
-
-  return { score, label, signals, methodology: "language-framing-v1" };
-}
+const { assessBiasSignal } = require('../frontend/src/lib/framing.cjs');
 
 function annotateArticles(articles) {
   articles.forEach((article) => {

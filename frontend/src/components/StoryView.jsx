@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import API_BASE_URL from '../config'
+import framing from '../lib/framing.cjs'
 import { createSearchFallback, getSavedStory } from '../data/stories'
 import { PageShell } from './Layout'
 
@@ -17,7 +18,7 @@ const summaryModes = {
 function SignalMeter({ bias }) {
   const score = bias?.score ?? 0
   return <div className="signal-meter">
-    <div className="signal-label"><span>Framing intensity</span><strong>{bias ? `${bias.label} · ${score}/100` : 'Not scored'}</strong></div>
+    <div className="signal-label"><span>Language signal · keyword heuristic</span><strong>{bias ? `${bias.label} · ${score}/100` : 'Not scored'}</strong></div>
     <div className="signal-track"><span style={{ width: `${score}%` }} /></div>
   </div>
 }
@@ -50,7 +51,7 @@ function ArticleModal({ source, onClose }) {
       <h2 id="article-modal-title">{source.title || 'Untitled article'}</h2>
       <p className="modal-summary">{source.summary || 'No excerpt is available for this article.'}</p>
       <SignalMeter bias={source.bias} />
-      <div className="signal-evidence"><h3>Why this score?</h3><ul>{(source.bias?.signals || ['This article has not been scored.']).map((signal) => <li key={signal}>{signal}</li>)}</ul><p>This score describes language in the available headline and excerpt. It is not a political leaning or factuality rating. Numbers look authoritative; methodology makes them accountable.</p></div>
+      <div className="signal-evidence"><h3>Why this score?</h3><ul>{(source.bias?.signals || ['This article has not been scored.']).map((signal) => <li key={signal}>{signal}</li>)}</ul><p>This score describes language in the available headline and excerpt. It is not a political leaning or factuality rating. This limited keyword heuristic can miss context, quotations, and framing without loaded words.</p></div>
       <div className="modal-actions"><button onClick={onClose}>Continue comparing</button>{source.url && <a href={source.url} target="_blank" rel="noreferrer">Open original article ↗</a>}</div>
     </section>
   </div>
@@ -80,7 +81,7 @@ export default function StoryView({ darkMode, setDarkMode }) {
       .then(async (response) => { if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || 'Unable to load this story') } return response.json() })
       .then((data) => { storyCache.set(id, data); setStory(data) })
       .catch((err) => {
-        if (err.name !== 'AbortError' && !isSearch) setError(err.message)
+        if (err.name !== 'AbortError') { if (isSearch) setRefreshError(err.message); else setError(err.message) }
       })
       .finally(() => { if (!controller.signal.aborted) setLoading(false) })
     return () => controller.abort()
@@ -102,13 +103,13 @@ export default function StoryView({ darkMode, setDarkMode }) {
       const response = await fetch(`${API_BASE_URL}/search/story?q=${encodeURIComponent(query)}`)
       if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || 'Live analysis is unavailable') }
       const data = await response.json(); storyCache.set(id, data); setStory(data)
-    } catch { setRefreshError('The live analysis service is unavailable. The saved parts of Skeptique still work.') } finally { setRefreshing(false) }
+    } catch (err) { setRefreshError(err.message) } finally { setRefreshing(false) }
   }
 
   if (loading) return <div className="app-shell"><div className="story-loading"><span className="loader" /><h1>{id?.startsWith('search:') ? 'Gathering live coverage' : 'Opening saved brief'}</h1><p>{id?.startsWith('search:') ? 'Finding articles and comparing their framing. This can take a few seconds.' : 'Loading the analysis…'}</p></div></div>
   if (error || !story) return <PageShell darkMode={darkMode} setDarkMode={setDarkMode}><main className="error-page"><span>!</span><h1>We couldn’t load this story</h1><p>{error}</p><button onClick={goHome}>Back to stories</button></main></PageShell>
 
-  const sources = story.sources || []
+  const sources = (story.sources || []).map((source) => ({ ...source, bias: framing.assessBiasSignal(source) }))
   const availableModes = Object.entries(summaryModes).filter(([key]) => story.combinedSummary?.[key])
   const summary = story.combinedSummary?.[mode] || story.combinedSummary?.content || 'No summary is available.'
 

@@ -30,4 +30,5 @@ function backendCompanion() {
 export default defineConfig(({ command }) => ({
   base: command === 'serve' ? '/' : '/skeptique/',
   plugins: [react(), backendCompanion()],
+  build: { commonjsOptions: { include: [/node_modules/, /framing\.cjs$/] } },
 }))
